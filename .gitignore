@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env*
+agy_config*.json
+agy_keys*.json
+agy_images/
+agy_workdir/
+agy_media/
+*.log
+nohup.out
+*.bak

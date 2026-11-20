@@ -1,0 +1,1548 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Local OpenAI-style HTTP adapter for the installed Antigravity CLI.
+
+Unofficial and experimental. Uses stream-json for chat and starts a new CLI
+process per turn from a warmed pool. See README.md for security boundaries.
+"""
+import argparse, base64, hashlib, json, mimetypes, os, queue, re, shutil, subprocess, sys, threading, time
+import urllib.parse, uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+STATE_DIR = os.path.dirname(os.path.abspath(__file__))
+IMAGE_DIR = os.path.join(STATE_DIR, "agy_images")
+AGY_HOME = os.path.expanduser("~/.gemini/antigravity-cli")
+WORKDIR = os.path.join(STATE_DIR, "agy_workdir")
+
+DEFAULT_CONFIG = {
+    "listen_host": "127.0.0.1",
+    "listen_port": 8321,
+    "agy_bin": "",                    # пусто = искать в AGY_BIN и PATH
+    "default_model": "gemini-3.8-flash-medium",
+    "extra_models": [],               # дополнительные id, если agy научится их выбирать
+    "pool_per_key": 1,                # прогретых процессов на пару (модель, effort)
+    "pool_max_processes": 6,          # жёсткий потолок живых процессов agy
+    "warm_models": [],                # модели для прогрева при старте; пусто = [default_model]
+    "spawn_timeout_sec": 60,          # ожидание init-события от нового процесса
+    "request_timeout_sec": 300,
+    "image_generation_timeout_sec": 120,
+    "max_concurrent": 2,              # (совместимость) ходы всё равно сериализует Pacer ниже
+    "min_turn_gap_sec": 4,            # мин. пауза между концом одного хода и началом следующего
+    "turn_gap_jitter_sec": 1.5,       # + случайный джиттер 0..N к паузе (человеческий темп)
+    "models_ttl_sec": 600,
+    "cleanup_chats": False,           # opt-in: удалить записи соответствующих сессий agy
+    "enable_image_generation": False, # experimental, opt-in
+    "max_request_bytes": 24 * 1024**2,
+    "facade_key": "",
+    "preamble": ("Reminder: You're in API mode. Reply with plain text only. "
+                 "Please don't call tools, read or write files, or run commands "
+                 "for this conversation."),
+}
+CFG = dict(DEFAULT_CONFIG)
+_lock = threading.Lock()
+STATS = {
+    "requests": 0,
+    "images": 0,
+    "media_turns": 0,
+    "by_model": {},
+    "by_key": {},
+    "tokens": {"prompt": 0, "completion": 0}
+}
+
+MIME_EXT_MAP = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/wave": ".wav",
+    "audio/mp3": ".mp3",
+    "audio/mpeg": ".mp3",
+    "audio/ogg": ".ogg",
+    "audio/flac": ".flac",
+    "audio/x-flac": ".flac",
+    "audio/m4a": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/aac": ".aac",
+}
+
+
+def log(msg):
+    sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    sys.stderr.flush()
+
+
+def find_agy():
+    if CFG.get("agy_bin"):
+        return CFG["agy_bin"]
+    env = os.environ.get("AGY_BIN")
+    if env:
+        return env
+    w = shutil.which("agy")
+    if w:
+        return w
+    return "agy"
+
+
+# ---------- ключи доступа (тот же UX, что у oc_facade) ----------
+KEYS_PATH = os.path.join(STATE_DIR, "agy_keys.json")
+
+
+def load_keys():
+    try:
+        with open(KEYS_PATH) as f:
+            return json.load(f).get("keys", [])
+    except Exception:
+        return []
+
+
+def save_keys(keys):
+    with open(KEYS_PATH, "w") as f:
+        json.dump({"keys": keys}, f, indent=1, ensure_ascii=False)
+
+
+def active_keys():
+    out = {}
+    for k in load_keys():
+        if k.get("enabled", True) and k.get("key"):
+            out[k["key"]] = k.get("name", "?")
+    if CFG.get("facade_key"):
+        out[CFG["facade_key"]] = "config"
+    return out
+
+
+def key_management(argv):
+    import secrets, string
+    cmd = argv[0] if argv else "list"
+    keys = load_keys()
+    if cmd == "list":
+        if not keys:
+            print("нет сохранённых ключей; для запуска требуется активный ключ")
+        for k in keys:
+            masked = (k["key"][:10] + "…") if len(k.get("key", "")) > 10 else k.get("key", "")
+            print(f"{k['name']:<16} {'on ' if k.get('enabled', True) else 'off'} {masked}  создан {k.get('created', '?')}")
+        return 0
+    if cmd == "add" and len(argv) > 1:
+        name = argv[1]
+        if any(k["name"] == name for k in keys):
+            print(f"ключ с именем {name} уже есть")
+            return 1
+        value = "agyf-" + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
+        keys.append({"name": name, "key": value, "enabled": True,
+                     "created": time.strftime("%Y-%m-%d %H:%M")})
+        save_keys(keys)
+        print(f"ключ для {name} (показывается один раз):\n{value}")
+        return 0
+    if cmd in ("remove", "enable", "disable") and len(argv) > 1:
+        name = argv[1]
+        if cmd == "remove":
+            keys = [k for k in keys if k["name"] != name]
+        else:
+            for k in keys:
+                if k["name"] == name:
+                    k["enabled"] = (cmd == "enable")
+        save_keys(keys)
+        print(f"готово: {cmd} {name}")
+        return 0
+    print("использование: keys list | add <имя> | remove <имя> | enable <имя> | disable <имя>")
+    return 2
+
+
+# ---------- каталог моделей ----------
+class ModelCatalog:
+    def __init__(self):
+        self.models = []
+        self.loaded_at = 0.0
+        self.fetching = False
+
+    def get(self):
+        with _lock:
+            stale = (time.time() - self.loaded_at) >= CFG["models_ttl_sec"]
+            if stale and not self.fetching:
+                self.fetching = True
+                threading.Thread(target=self._refresh, daemon=True).start()
+            return list(self.models)
+
+    def _refresh(self):
+        try:
+            out = subprocess.run([find_agy(), "models"], capture_output=True, text=True,
+                                 stdin=subprocess.DEVNULL, start_new_session=True,
+                                 timeout=60, cwd=STATE_DIR).stdout
+            ids = []
+            for line in out.splitlines():
+                parts = line.split("\t")
+                mid = parts[0].strip()
+                if mid and (mid.startswith(("gemini", "claude", "gpt"))):
+                    ids.append(mid)
+            if ids:
+                with _lock:
+                    self.models = ids
+                    self.loaded_at = time.time()
+        except Exception as e:
+            log(f"каталог agy models: {e}")
+        finally:
+            with _lock:
+                self.fetching = False
+                if not self.models:
+                    self.models = ["gemini-3.8-flash-high", "gemini-3.8-flash-medium",
+                                   "gemini-3.8-flash-low", "claude-sonnet-4-6",
+                                   "claude-opus-4-6-thinking", "gpt-oss-120b-medium"]
+                    self.loaded_at = time.time()
+
+
+CATALOG = ModelCatalog()
+
+
+# ---------- извлечение мультимедиа (изображения и аудио) ----------
+def sniff_mime(raw_bytes: bytes) -> str:
+    """Определяет MIME-тип по сигнатуре (magic bytes)."""
+    if not raw_bytes or len(raw_bytes) < 2:
+        return "application/octet-stream"
+    # JPEG (SOI маркер 0xFF 0xD8)
+    if raw_bytes.startswith(b"\xff\xd8"):
+        return "image/jpeg"
+    # PNG
+    if raw_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    # GIF
+    if raw_bytes.startswith(b"GIF87a") or raw_bytes.startswith(b"GIF89a"):
+        return "image/gif"
+    # WEBP
+    if len(raw_bytes) >= 12 and raw_bytes[:4] == b"RIFF" and raw_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    # BMP
+    if raw_bytes.startswith(b"BM"):
+        return "image/bmp"
+    # TIFF
+    if raw_bytes.startswith(b"II*\x00") or raw_bytes.startswith(b"MM\x00*"):
+        return "image/tiff"
+    # AVIF / HEIC (ftyp box)
+    if len(raw_bytes) >= 12 and raw_bytes[4:8] == b"ftyp":
+        brand = raw_bytes[8:12]
+        if brand in (b"avif", b"avis"):
+            return "image/avif"
+        if brand in (b"heic", b"heix", b"hevc", b"mif1", b"msf1"):
+            return "image/heic"
+    # Аудио форматы
+    if len(raw_bytes) >= 12 and raw_bytes[:4] == b"RIFF" and raw_bytes[8:12] == b"WAVE":
+        return "audio/wav"
+    if raw_bytes.startswith(b"ID3") or (len(raw_bytes) >= 2 and raw_bytes[0] == 0xff and (raw_bytes[1] & 0xe0) == 0xe0):
+        return "audio/mpeg"
+    if raw_bytes.startswith(b"OggS"):
+        return "audio/ogg"
+    if raw_bytes.startswith(b"fLaC"):
+        return "audio/flac"
+    return "application/octet-stream"
+
+
+def _decode_b64(b64_str: str) -> bytes:
+    """Безопасное декодирование base64/base64url с автодополнением паддинга."""
+    clean = re.sub(r"\s+", "", str(b64_str or "")).replace("-", "+").replace("_", "/")
+    pad = -len(clean) % 4
+    if pad:
+        clean += "=" * pad
+    return base64.b64decode(clean)
+
+
+def parse_media_value(val):
+    """
+    Парсер медиа: принимает inline data URI, raw base64 или dict с inline-данными.
+    Возвращает (mime, data_bytes) или (None, None).
+    """
+    if not val:
+        return None, None
+
+    if isinstance(val, bytes):
+        mime = sniff_mime(val)
+        return mime, val
+
+    if isinstance(val, dict):
+        # Anthropic format: {"type": "base64", "media_type": "...", "data": "..."}
+        src = val.get("source")
+        if isinstance(src, dict):
+            b64 = src.get("data")
+            mime = src.get("media_type") or "image/png"
+            if b64:
+                try:
+                    data = _decode_b64(b64)
+                    return (mime or sniff_mime(data)), data
+                except Exception:
+                    pass
+
+        # OpenAI image_url dict format
+        if "image_url" in val:
+            return parse_media_value(val["image_url"])
+        if "input_image" in val:
+            return parse_media_value(val["input_image"])
+        if "input_audio" in val:
+            return parse_media_value(val["input_audio"])
+
+        # generic dict: url, b64, base64, data, image, file, audio
+        for k in ("url", "b64", "base64", "data", "image", "file", "audio", "path"):
+            if k in val and val[k]:
+                mime_hint = val.get("mime_type") or val.get("mime") or val.get("media_type")
+                m, d = parse_media_value(val[k])
+                if d:
+                    return (mime_hint or m), d
+        return None, None
+
+    if not isinstance(val, str):
+        return None, None
+
+    s = val.strip()
+
+    # 1. data: URI
+    if s.startswith("data:"):
+        try:
+            header, b64_part = s.split(",", 1)
+            if "%" in b64_part:
+                b64_part = urllib.parse.unquote(b64_part)
+            data = _decode_b64(b64_part)
+            mime = "application/octet-stream"
+            parts = header[5:].split(";")
+            if parts and parts[0] and "/" in parts[0]:
+                mime = parts[0].strip().lower()
+            sniffed = sniff_mime(data)
+            if not mime or mime in ("application/octet-stream", "text/plain"):
+                mime = sniffed
+            return mime, data
+        except Exception as e:
+            log(f"debug: data: URI parse: {e}")
+            return None, None
+
+    # Только inline base64: без HTTP-загрузок и открытия путей клиента.
+    clean_s = re.sub(r"\s+", "", s)
+    if len(clean_s) >= 32 and re.match(r"^[A-Za-z0-9+/=_\-]+$", clean_s):
+        try:
+            data = _decode_b64(clean_s)
+            mime = sniff_mime(data)
+            if mime.startswith(("image/", "audio/")):
+                return mime, data
+        except Exception:
+            pass
+
+    return None, None
+
+
+# Совместимость со старым именем
+def parse_data_uri(uri):
+    return parse_media_value(uri)
+
+
+def extract_data_uris_from_text(text):
+    """
+    Вытаскивает встроенные data-URI, HTML img-теги, markdown и кастомные теги из строк чата.
+    """
+    if not isinstance(text, str):
+        return str(text or ""), []
+
+    found = []
+
+    def _repl_media(raw_val):
+        mime, data = parse_media_value(raw_val)
+        if data:
+            found.append((mime, data))
+            return "[Attached Image]" if mime.startswith("image/") else "[Attached Audio]"
+        return None
+
+    # 1. Регулярка для markdown картинок ![alt](src)
+    def _sub_md_img(m):
+        res = _repl_media(m.group(1).strip())
+        return res if res else m.group(0)
+
+    cleaned = re.sub(r"!\[[^\]]*\]\(([^)]+)\)", _sub_md_img, text)
+
+    # 2. Регулярка для <img src="...">
+    def _sub_img_tag(m):
+        res = _repl_media(m.group(1).strip())
+        return res if res else m.group(0)
+
+    cleaned = re.sub(r"""<img\s+[^>]*src=["']([^"']+)["'][^>]*>""", _sub_img_tag, cleaned, flags=re.IGNORECASE)
+
+    # 3. Регулярка для [img]...[/img], <image>...</image>
+    def _sub_tagged(m):
+        res = _repl_media(m.group(1).strip())
+        return res if res else m.group(0)
+
+    cleaned = re.sub(r"\[img\](.*?)\[/img\]", _sub_tagged, cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"<image>(.*?)</image>", _sub_tagged, cleaned, flags=re.IGNORECASE | re.DOTALL)
+
+    # 4. Регулярка для автономных data: URI
+    def _sub_data(m):
+        res = _repl_media(m.group(0).strip())
+        return res if res else m.group(0)
+
+    pattern_data = r"data:(?:image|audio)/[a-zA-Z0-9\.\-\+]+(?:;[^\s,]+)*,[A-Za-z0-9+/=_\-\s\r\n]+"
+    cleaned = re.sub(pattern_data, _sub_data, cleaned)
+
+    return cleaned, found
+
+
+def build_prompt_and_media(req_or_messages, maybe_messages=None):
+    """
+    Формирует текст промпта и список медиа-объектов (mime, bytes):
+      prompt: свёрнутая беседа
+      media_items: [(mime, raw_bytes), ...]
+    Поддерживает:
+      - req["images"], req["image"], req["picture"], req["files"] и т.д.
+      - m["images"], m["image"], m["media"], m["attachment"], m["image_url"]
+      - m["content"] как строка с inline data URI / тегами
+      - m["content"] как список блоков OpenAI / Anthropic
+      - дедупликацию по SHA-256
+      - правильную привязку картинок к последнему сообщению пользователя
+      - отсечение старых картинок из далёкой истории, чтобы не забивать контекст
+    """
+    if maybe_messages is not None:
+        req = req_or_messages if isinstance(req_or_messages, dict) else {}
+        messages = maybe_messages
+    elif isinstance(req_or_messages, dict):
+        req = req_or_messages
+        messages = req.get("messages") or []
+    else:
+        req = {}
+        messages = req_or_messages or []
+
+    system, turns = [], []
+    seen_hashes = set()
+
+    def _hash_data(d):
+        return hashlib.sha256(d).hexdigest()
+
+    # 1. Верхний уровень запроса (SillyTavern, самописные клиенты, Kobold, Ollama)
+    top_media = []
+    for top_key in ("images", "image", "picture", "pictures", "media", "files", "file", "photos", "photo"):
+        top_val = req.get(top_key)
+        if top_val:
+            val_list = top_val if isinstance(top_val, list) else [top_val]
+            for item in val_list:
+                m, d = parse_media_value(item)
+                if d:
+                    h = _hash_data(d)
+                    if h not in seen_hashes:
+                        seen_hashes.add(h)
+                        top_media.append((m, d))
+
+    # Находим индекс последнего сообщения пользователя в истории
+    last_user_idx = None
+    for idx in range(len(messages) - 1, -1, -1):
+        if messages[idx].get("role") == "user":
+            last_user_idx = idx
+            break
+
+    # Списки медиа: текущие (для этого хода) и исторические (из прошлых ходов)
+    current_turn_media = list(top_media)
+    history_media = []
+
+    img_idx, aud_idx = 0, 0
+    top_media_attached = False
+
+    for i, m in enumerate(messages or []):
+        role = m.get("role", "user")
+        is_current_user_turn = (i == last_user_idx)
+        turn_attached = []
+
+        # Поля на уровне самого сообщения (m["images"], m["image"], m["image_url"] и т.д.)
+        for msg_key in ("images", "image", "picture", "pictures", "media", "files", "file", "attachment", "attachments", "image_url"):
+            val = m.get(msg_key)
+            if val:
+                val_list = val if isinstance(val, list) else [val]
+                for item in val_list:
+                    mime, data = parse_media_value(item)
+                    if data:
+                        h = _hash_data(data)
+                        if h not in seen_hashes:
+                            seen_hashes.add(h)
+                            if is_current_user_turn:
+                                current_turn_media.append((mime, data))
+                            else:
+                                history_media.append((mime, data))
+                        if mime.startswith("image/"):
+                            img_idx += 1
+                            turn_attached.append(f"[Attached Image #{img_idx}]")
+                        else:
+                            aud_idx += 1
+                            turn_attached.append(f"[Attached Audio #{aud_idx}]")
+
+        content = m.get("content", "")
+
+        if isinstance(content, list):
+            turn_texts = []
+            for p in content:
+                if isinstance(p, str):
+                    cleaned_txt, inlines = extract_data_uris_from_text(p)
+                    for item in inlines:
+                        h = _hash_data(item[1])
+                        if h not in seen_hashes:
+                            seen_hashes.add(h)
+                            if is_current_user_turn:
+                                current_turn_media.append(item)
+                            else:
+                                history_media.append(item)
+                    turn_texts.append(cleaned_txt)
+                    continue
+
+                if not isinstance(p, dict):
+                    continue
+
+                ptype = p.get("type", "")
+
+                if ptype == "text":
+                    raw_txt = p.get("text", "")
+                    cleaned_txt, inlines = extract_data_uris_from_text(raw_txt)
+                    for item in inlines:
+                        h = _hash_data(item[1])
+                        if h not in seen_hashes:
+                            seen_hashes.add(h)
+                            if is_current_user_turn:
+                                current_turn_media.append(item)
+                            else:
+                                history_media.append(item)
+                    turn_texts.append(cleaned_txt)
+
+                elif ptype in ("image_url", "image", "input_image"):
+                    m, d = parse_media_value(p.get("image_url") or p.get("image") or p.get("source") or p.get("url") or p.get("data") or p)
+                    if d:
+                        h = _hash_data(d)
+                        if h not in seen_hashes:
+                            seen_hashes.add(h)
+                            if is_current_user_turn:
+                                current_turn_media.append((m, d))
+                            else:
+                                history_media.append((m, d))
+                        img_idx += 1
+                        turn_texts.append(f"[Attached Image #{img_idx}]")
+
+                elif ptype in ("input_audio", "audio_url", "audio"):
+                    m, d = parse_media_value(p.get("input_audio") or p.get("audio_url") or p.get("audio") or p.get("source") or p.get("url") or p.get("data") or p)
+                    if d:
+                        h = _hash_data(d)
+                        if h not in seen_hashes:
+                            seen_hashes.add(h)
+                            if is_current_user_turn:
+                                current_turn_media.append((m, d))
+                            else:
+                                history_media.append((m, d))
+                        aud_idx += 1
+                        turn_texts.append(f"[Attached Audio #{aud_idx}]")
+
+                else:
+                    # Универсальная попытка извлечь медиа из произвольного блока
+                    m, d = parse_media_value(p)
+                    if d:
+                        h = _hash_data(d)
+                        if h not in seen_hashes:
+                            seen_hashes.add(h)
+                            if is_current_user_turn:
+                                current_turn_media.append((m, d))
+                            else:
+                                history_media.append((m, d))
+                        if m.startswith("image/"):
+                            img_idx += 1
+                            turn_texts.append(f"[Attached Image #{img_idx}]")
+                        else:
+                            aud_idx += 1
+                            turn_texts.append(f"[Attached Audio #{aud_idx}]")
+                    elif p.get("text"):
+                        cleaned_txt, inlines = extract_data_uris_from_text(p["text"])
+                        for item in inlines:
+                            h = _hash_data(item[1])
+                            if h not in seen_hashes:
+                                seen_hashes.add(h)
+                                if is_current_user_turn:
+                                    current_turn_media.append(item)
+                                else:
+                                    history_media.append(item)
+                        turn_texts.append(cleaned_txt)
+
+            content = "\n".join(turn_texts)
+        else:
+            raw_txt = str(content or "")
+            cleaned_txt, inlines = extract_data_uris_from_text(raw_txt)
+            for item in inlines:
+                h = _hash_data(item[1])
+                if h not in seen_hashes:
+                    seen_hashes.add(h)
+                    if is_current_user_turn:
+                        current_turn_media.append(item)
+                    else:
+                        history_media.append(item)
+            content = cleaned_txt
+
+        if turn_attached:
+            content = (content + "\n" + "\n".join(turn_attached)).strip()
+
+        # Прикрепляем ссылки на медиа верхнего уровня К ПОСЛЕДНЕМУ сообщению пользователя!
+        if is_current_user_turn and not top_media_attached and top_media:
+            top_markers = []
+            for top_m, _ in top_media:
+                if top_m.startswith("image/"):
+                    img_idx += 1
+                    top_markers.append(f"[Attached Image #{img_idx}]")
+                elif top_m.startswith("audio/"):
+                    aud_idx += 1
+                    top_markers.append(f"[Attached Audio #{aud_idx}]")
+            if top_markers:
+                content = (content + "\n" + "\n".join(top_markers)).strip()
+                top_media_attached = True
+
+        if role in ("system", "developer"):
+            system.append(content)
+        else:
+            turns.append(f"[{role}]\n{content}")
+
+    # Определяем итоговый список медиафайлов для передачи в agy:
+    # Собираем актуальные медиа: текущие + недавние из истории (до 8 файлов суммарно),
+    # чтобы модель видела и новые картинки, и картинки из предыдущих сообщений/реплаев.
+    MAX_ATTACHED_MEDIA = 8
+    active_media = list(current_turn_media)
+    if history_media:
+        needed = MAX_ATTACHED_MEDIA - len(active_media)
+        if needed > 0:
+            active_media = history_media[-needed:] + active_media
+
+    parts = []
+    if CFG.get("preamble"):
+        parts.append(CFG["preamble"])
+    if system:
+        parts.append("<system_instructions>\n" + "\n\n".join(system) + "\n</system_instructions>")
+    parts.append("<conversation>\n" + "\n\n".join(turns) + "\n</conversation>")
+    if active_media:
+        parts.append(
+            "Write the next assistant message in plain text. "
+            "You may use the read_file tool to inspect the attached media file(s). "
+            "Do not invoke terminal commands, write_file, edit_file, or subagents."
+        )
+    else:
+        parts.append(
+            "Write the next assistant message only in plain text. Do not invoke tools, commands, or subagents."
+        )
+    return "\n\n".join(parts), active_media
+
+
+# ---------- генерация изображений через agy (субагент image-generator) ----------
+def generate_image_via_agy(prompt, size=None, timeout=120):
+    os.makedirs(IMAGE_DIR, exist_ok=True)
+    brain_dir = os.path.join(AGY_HOME, "brain")
+    existing_brain_images = set()
+    if os.path.exists(brain_dir):
+        for root, _, files in os.walk(brain_dir):
+            for f in files:
+                if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                    existing_brain_images.add(os.path.join(root, f))
+
+    instruction = (
+        f"Generate an image: {prompt}. "
+        f"{f'Preferred size/aspect: {size}. ' if size else ''}"
+        "Use the image-generator subagent and save the result as a session artifact."
+    )
+    cmd = [find_agy(), "-p", instruction]
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=STATE_DIR)
+    stdout = proc.stdout or ""
+
+    found_path = None
+    if os.path.isdir(brain_dir):
+        root_real = os.path.realpath(brain_dir)
+        new_files = []
+        for root, _, files in os.walk(brain_dir):
+            for f in files:
+                if not f.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                    continue
+                fp = os.path.join(root, f)
+                fp_real = os.path.realpath(fp)
+                if (fp not in existing_brain_images and not os.path.islink(fp)
+                        and os.path.commonpath([root_real, fp_real]) == root_real
+                        and os.path.isfile(fp_real)):
+                    try:
+                        new_files.append((os.path.getmtime(fp_real), fp_real))
+                    except OSError:
+                        pass
+        if new_files:
+            found_path = max(new_files)[1]
+
+    if not found_path or not os.path.isfile(found_path):
+        err_msg = stdout.strip() or proc.stderr.strip() or "image generation failed to produce an image file"
+        raise AgyError(f"Image generation failed: {err_msg[:300]}", 502)
+
+    ext = os.path.splitext(found_path)[1].lower() or ".jpg"
+    img_name = f"img_{uuid.uuid4().hex[:16]}{ext}"
+    dest_path = os.path.join(IMAGE_DIR, img_name)
+    shutil.copy2(found_path, dest_path)
+    return dest_path, img_name
+
+
+# ---------- один процесс agy (stream-json) ----------
+class AgyError(Exception):
+    def __init__(self, message, status=502):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+
+def cleanup_conversation(conv_id):
+    """Убрать следы одной беседы фасада из домашнего каталога agy (best effort)."""
+    if not conv_id or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", conv_id) or not CFG.get("cleanup_chats"):
+        return
+    for base in ("conversations", "brain", "annotations"):
+        d = os.path.join(AGY_HOME, base)
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            if name == conv_id or name == conv_id + ".json":
+                path = os.path.join(d, name)
+                try:
+                    if os.path.isdir(path) and not os.path.islink(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.unlink(path)
+                except OSError:
+                    pass
+
+
+class Worker:
+    """Прогретый процесс agy, ждущий init. Один процесс — один запрос."""
+
+    def __init__(self, model, effort):
+        self.model = model
+        self.effort = effort
+        self.events = queue.Queue()
+        self.conversation_id = None
+        self.spawn_error = None
+        self.ready = threading.Event()
+        self.dead = False
+        os.makedirs(WORKDIR, exist_ok=True)
+        cmd = [find_agy(), "--input-format", "stream-json", "--output-format", "stream-json",
+               "-p=", "--disable-slash-commands", "--model", model]
+        if effort:
+            cmd += ["--effort", effort]
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, text=True, bufsize=1, cwd=WORKDIR,
+                                     start_new_session=True)
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        try:
+            for line in self.proc.stdout:
+                line_lower = line.lower()
+                if any(w in line_lower for w in ("safety", "blocked", "filter", "refusal", "harm", "prohibit")):
+                    clean_msg = line.strip()
+                    if len(clean_msg) > 300:
+                        clean_msg = clean_msg[:300] + "..."
+                    log(f"⚠️ [SAFETY LINE] {clean_msg}")
+
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                if ev.get("event") == "init":
+                    self.conversation_id = (ev.get("init") or {}).get("conversation_id") \
+                        or ev.get("conversation_id")
+                    self.ready.set()
+                elif ev.get("event") == "result" and not self.ready.is_set():
+                    self.spawn_error = (ev.get("result") or {}).get("error") or "agy failed to start"
+                self.events.put(ev)
+        except Exception:
+            pass
+        self.dead = True
+        self.events.put(None)
+
+    def wait_ready(self, timeout):
+        return self.ready.wait(timeout) and not self.dead
+
+    def run_turn(self, prompt, media_items=None, on_delta=None, timeout=300, abort_event=None, stop=None):
+        """
+        Один ход: раскладывает медиафайлы в сессионную .user_uploaded,
+        добавляет метаданные и шлёт user-событие. Поддерживает мгновенный abort и stop-последовательности.
+        """
+        media_payload = []
+        if media_items:
+            conv_id = self.conversation_id
+            if not isinstance(conv_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conv_id):
+                raise AgyError("agy did not return a usable media session ID")
+            upload_dir = os.path.join(AGY_HOME, "brain", conv_id, ".user_uploaded")
+            os.makedirs(upload_dir, exist_ok=True)
+            images_paths, audios_paths = [], []
+            ws_dir = os.path.join(WORKDIR, "uploads")
+            os.makedirs(ws_dir, exist_ok=True)
+            for i, (mime, data) in enumerate(media_items):
+                ext = MIME_EXT_MAP.get(mime, ".jpg" if mime.startswith("image/") else ".wav")
+                fname = f"media_{i}_{uuid.uuid4().hex[:8]}{ext}"
+                dest_path = os.path.join(upload_dir, fname)
+                dest_ws = os.path.join(ws_dir, fname)
+                try:
+                    with open(dest_path, "wb") as f:
+                        f.write(data)
+                    with open(dest_ws, "wb") as f:
+                        f.write(data)
+                    dest_fwd = dest_path.replace("\\", "/")
+                    media_payload.append({"mime_type": mime, "uri": dest_fwd})
+                    if mime.startswith("image/"):
+                        images_paths.append(dest_fwd)
+                    elif mime.startswith("audio/"):
+                        audios_paths.append(dest_fwd)
+                except OSError as e:
+                    log(f"warning: save upload media: {e}")
+
+            log(f"media ready: {len(media_payload)} file(s) saved to {upload_dir} and {ws_dir}")
+
+            meta_parts = []
+            if images_paths:
+                meta_parts.append(f"The user has attached {len(images_paths)} image file(s):")
+                for idx, img in enumerate(images_paths, start=1):
+                    meta_parts.append(f"- Image #{idx}: {img}")
+                meta_parts.append(
+                    "You MUST use the read_file tool to inspect the image file(s) listed above before answering. "
+                    "Make sure to inspect every image file so you can distinguish between different photos or compare them. "
+                    "Directly call the read_file tool without generating thought commentary. "
+                    "After reading the image(s), write your final assistant response in plain text. "
+                    "Do not run terminal commands, edit files, or invoke any other tools."
+                )
+            if audios_paths:
+                meta_parts.append(f"The user has attached {len(audios_paths)} audio file(s):")
+                for idx, aud in enumerate(audios_paths, start=1):
+                    meta_parts.append(f"- Audio #{idx}: {aud}")
+                meta_parts.append(
+                    "You MUST use the read_file tool to inspect the audio file(s) listed above before answering. "
+                    "Directly call the read_file tool without generating thought commentary. "
+                    "After reading, write your final assistant response in plain text. "
+                    "Do not run terminal commands, edit files, or invoke any other tools."
+                )
+
+            if meta_parts:
+                prompt += "\n\n<ADDITIONAL_METADATA>\n" + "\n".join(meta_parts) + "\n</ADDITIONAL_METADATA>"
+
+        user_msg = {"role": "user", "content": prompt}
+        if media_payload:
+            user_msg["media"] = media_payload
+
+        line = json.dumps({"event": "user", "message": user_msg}, ensure_ascii=False)
+        try:
+            self.proc.stdin.write(line + "\n")
+            self.proc.stdin.flush()
+        except Exception as e:
+            raise AgyError(f"agy stdin: {e}")
+
+        # Нормализуем стоп-последовательности
+        stop_list = []
+        if isinstance(stop, str) and stop:
+            stop_list = [stop]
+        elif isinstance(stop, list):
+            stop_list = [s for s in stop if isinstance(s, str) and s]
+        for def_stop in ("\n[user]", "\n[User]", "\n<conversation>", "\n</conversation>"):
+            if def_stop not in stop_list:
+                stop_list.append(def_stop)
+
+        text_parts, usage = [], None
+        last_step_idx = None
+        has_streamed_in_step = False
+        stopped = False
+        safety_detected_in_turn = False
+        deadline = time.time() + timeout
+        while True:
+            if abort_event and abort_event.is_set():
+                self.close()
+                raise AgyError("client aborted turn", 499)
+
+            left = deadline - time.time()
+            if left <= 0:
+                raise AgyError("agy timed out", 504)
+            try:
+                ev = self.events.get(timeout=min(left, 2))
+            except queue.Empty:
+                if self.dead:
+                    raise AgyError("agy process died mid-turn")
+                continue
+            if ev is None:
+                raise AgyError("agy closed the stream mid-turn")
+            kind = ev.get("event")
+            if kind == "step_update":
+                su = ev.get("step_update") or {}
+                stype = su.get("step_type")
+                step_idx = su.get("step_index")
+
+                # Проверяем событие на цензуру, блокировки и ошибки
+                su_str = json.dumps(su, ensure_ascii=False)
+                if any(w in su_str.lower() for w in ("safety", "blocked", "refusal", "filter", "harm", "prohibit")):
+                    log(f"⚠️ [SAFETY IN STEP] step={step_idx} {su_str[:250]}")
+                    safety_detected_in_turn = True
+
+                if stype == "agent_response":
+                    is_tool_call_step = bool(su.get("tool_calls") or su.get("tool_call") or su.get("call"))
+                    if last_step_idx is not None and step_idx != last_step_idx:
+                        log(f"⚠️ [MULTI-STEP] agent_response step changed: {last_step_idx} -> {step_idx}")
+                        # Если предыдущий шаг был заблокирован фильтром, блокируем дальнейший стрим
+                        if safety_detected_in_turn and has_streamed_in_step:
+                            log(f"⚠️ [SAFETY RETRY DETECTED] Предыдущий шаг заблокирован фильтром — останавливаем дальнейший стрим!")
+                            stopped = True
+                        else:
+                            text_parts = []
+                    last_step_idx = step_idx
+
+                    delta = su.get("text_delta") or ""
+                    if is_tool_call_step and media_items:
+                        delta = ""
+                    if delta and not stopped:
+                        text_parts.append(delta)
+                        has_streamed_in_step = True
+
+                        # Логируем рефьюзы прямо из дельты текста
+                        if any(kw in delta.lower() for kw in ("blocked by content safety filters", "safety guidelines", "cannot fulfill this request")):
+                            log(f"⚠️ [REFUSAL IN TEXT] {delta.strip()[:150]}")
+                            safety_detected_in_turn = True
+
+                        full_so_far = "".join(text_parts)
+                        hit_stop = None
+                        for s in stop_list:
+                            if s in full_so_far:
+                                hit_stop = s
+                                break
+                        if hit_stop:
+                            stopped = True
+                            cutoff_idx = full_so_far.find(hit_stop)
+                            emitted_len = len("".join(text_parts[:-1]))
+                            valid_delta = full_so_far[emitted_len:cutoff_idx]
+                            if valid_delta and on_delta:
+                                on_delta(valid_delta)
+                        else:
+                            if on_delta:
+                                on_delta(delta)
+                if su.get("usage"):
+                    usage = su["usage"]
+            elif kind == "result":
+                r = ev.get("result") or {}
+                if r.get("usage"):
+                    usage = r["usage"]
+                r_err = str(r.get("error") or "")
+                r_resp = str(r.get("response") or "")
+                if any(w in r_err.lower() for w in ("safety", "blocked", "refusal", "filter")):
+                    log(f"⚠️ [SAFETY IN RESULT] {r_err[:300]}")
+                    safety_detected_in_turn = True
+
+                is_safety = safety_detected_in_turn or any(
+                    w in r_err.lower() or w in r_resp.lower()
+                    for w in ("safety", "blocked", "refusal", "filter", "policy", "prohibit")
+                )
+
+                if r.get("status") == "SUCCESS":
+                    if not on_delta and r_resp.strip():
+                        text = r_resp
+                    else:
+                        text = "".join(text_parts)
+                        if not text.strip() and r_resp.strip():
+                            text = r_resp
+                            if on_delta and not has_streamed_in_step:
+                                on_delta(text)
+                    for s in stop_list:
+                        if s in text:
+                            text = text.split(s, 1)[0]
+                    return text, usage or {}
+
+                # Если статус ERROR:
+                # 1. Спасение текста: если модель успела что-то ответить до блокировки или отдала ответ в result["response"]
+                rescued_text = "".join(text_parts).strip() or r_resp.strip()
+                if rescued_text and is_safety:
+                    log(f"⚠️ [SAFETY RESCUE] Возвращаем текст ({len(rescued_text)} симв) несмотря на статус ERROR")
+                    for s in stop_list:
+                        if s in rescued_text:
+                            rescued_text = rescued_text.split(s, 1)[0]
+                    if on_delta and not has_streamed_in_step:
+                        on_delta(rescued_text)
+                    return rescued_text, usage or {}
+
+                # 2. Если текста нет, но это блокировка цензуры/безопасности
+                if is_safety:
+                    refusal_msg = "I am unable to fulfill this request or process the attached image due to content safety policies."
+                    log(f"⚠️ [SAFETY REFUSAL] Преобразуем блокировку в понятный отказ: {r_err[:150]}")
+                    if on_delta and not has_streamed_in_step:
+                        on_delta(refusal_msg)
+                    return refusal_msg, usage or {}
+
+                raise AgyError(str(r.get("error") or "agy turn failed"),
+                              429 if "quota" in r_err.lower() or "rate" in r_err.lower() else 502)
+
+    def close(self):
+        try:
+            self.proc.kill()
+        except Exception:
+            pass
+        cleanup_conversation(self.conversation_id)
+
+
+# ---------- пул прогретых процессов ----------
+class Pool:
+    def __init__(self):
+        self.idle = {}            # (model, effort) -> [Worker]
+        self.total = 0
+        self.cond = threading.Condition()
+
+    def _spawn_async(self, key):
+        def job():
+            try:
+                w = Worker(*key)
+                if w.wait_ready(CFG["spawn_timeout_sec"]):
+                    with self.cond:
+                        self.idle.setdefault(key, []).append(w)
+                        self.cond.notify_all()
+                    return
+                log(f"spawn {key}: воркер не поднялся: {w.spawn_error or 'нет init'}")
+                w.close()
+            except Exception as e:
+                log(f"spawn {key}: {e}")
+            with self.cond:
+                self.total -= 1
+                self.cond.notify_all()
+        threading.Thread(target=job, daemon=True).start()
+
+    def warm(self, model, effort=None):
+        key = (model, effort)
+        with self.cond:
+            have = len(self.idle.get(key, []))
+            for _ in range(max(0, CFG["pool_per_key"] - have)):
+                if self.total >= CFG["pool_max_processes"]:
+                    break
+                self.total += 1
+                self._spawn_async(key)
+
+    def acquire(self, model, effort):
+        key = (model, effort)
+        deadline = time.time() + CFG["spawn_timeout_sec"] + 10
+        while True:
+            with self.cond:
+                lst = self.idle.get(key, [])
+                while lst:
+                    w = lst.pop(0)
+                    if not w.dead:
+                        if self.total < CFG["pool_max_processes"]:
+                            self.total += 1
+                            self._spawn_async(key)
+                        return w
+                    self.total -= 1
+                if self.total < CFG["pool_max_processes"]:
+                    self.total += 1
+                    self._spawn_async(key)
+                left = deadline - time.time()
+                if left <= 0:
+                    raise AgyError("no agy worker became ready in time", 503)
+                self.cond.wait(timeout=min(left, 2))
+
+    def release_dead(self, w):
+        with self.cond:
+            self.total -= 1
+            self.cond.notify_all()
+        w.close()
+
+
+POOL = Pool()
+
+
+# ---------- сериализация и интервал между запросами ----------
+class Pacer:
+    """Строго последовательные ходы + пауза между частыми запросами."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.last_end = 0.0
+        self.turns = 0
+        self.waited_sec = 0.0
+
+    def run(self, fn):
+        with self.lock:
+            gap = float(CFG.get("min_turn_gap_sec", 0) or 0)
+            jitter = float(CFG.get("turn_gap_jitter_sec", 0) or 0)
+            if jitter > 0:
+                import random
+                gap += random.uniform(0, jitter)
+            wait = self.last_end + gap - time.time()
+            if wait > 0:
+                time.sleep(wait)
+                self.waited_sec += wait
+            try:
+                return fn()
+            finally:
+                self.last_end = time.time()
+                self.turns += 1
+
+
+PACER = Pacer()
+
+
+# ---------- HTTP-фасад ----------
+EFFORT_MAP = {"minimal": "low", "low": "low", "medium": "medium",
+              "high": "high", "xhigh": "xhigh", "max": "max"}
+IMAGE_MODELS = ("image-generator", "imagen-3", "dall-e-3")
+
+
+def openai_error(status, message, etype="upstream_error"):
+    return {"error": {"message": message, "type": etype, "code": status}}
+
+
+def map_usage(u):
+    if not u:
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    return {"prompt_tokens": u.get("input_tokens", 0),
+            "completion_tokens": u.get("output_tokens", 0),
+            "total_tokens": u.get("total_tokens",
+                                  u.get("input_tokens", 0) + u.get("output_tokens", 0))}
+
+
+class SafeThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        err = sys.exc_info()[1]
+        if isinstance(err, (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "agy-facade/1.0"
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _json(self, status, obj, extra_headers=None):
+        try:
+            data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            for k, v in (extra_headers or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log(f"warning: _json error: {e}")
+
+    def _authorized(self):
+        import hmac
+        act = active_keys()
+        if not act:
+            return None
+        provided = []
+        auth = self.headers.get("Authorization") or ""
+        if auth.startswith("Bearer "):
+            provided.append(auth[7:])
+        if self.headers.get("x-api-key"):
+            provided.append(self.headers.get("x-api-key"))
+        for p in provided:
+            for value, name in act.items():
+                if isinstance(value, str) and hmac.compare_digest(p.encode(), value.encode()):
+                    return name
+        return None
+
+    def do_GET(self):
+        path = self.path.rstrip("/")
+
+        # Раздача только собственных сгенерированных изображений.
+        if path.startswith("/v1/images/") or path.startswith("/images/"):
+            if not self._authorized():
+                return self._json(401, openai_error(401, "missing or invalid api key", "auth_error"))
+            fname = os.path.basename(path)
+            fpath = os.path.join(IMAGE_DIR, fname)
+            if not re.fullmatch(r"img_[0-9a-f]{16}\.(jpg|jpeg|png|webp)", fname) or os.path.islink(fpath) or not os.path.isfile(fpath):
+                return self._json(404, openai_error(404, "image not found", "invalid_request_error"))
+            ext = os.path.splitext(fname)[1].lower()
+            ctype = "image/jpeg"
+            if ext == ".png":
+                ctype = "image/png"
+            elif ext == ".webp":
+                ctype = "image/webp"
+            with open(fpath, "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "private, no-store")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if path in ("/v1/models", "/models"):
+            if not self._authorized():
+                return self._json(401, openai_error(401, "missing or invalid api key", "auth_error"))
+            ids = CATALOG.get()
+            for extra in CFG.get("extra_models", []):
+                if extra not in ids:
+                    ids.append(extra)
+            for img_mod in (("image-generator", "imagen-3") if CFG.get("enable_image_generation") else ()):
+                if img_mod not in ids:
+                    ids.append(img_mod)
+            data = [{"id": m, "object": "model", "created": 0, "owned_by": "antigravity"}
+                    for m in sorted(ids)]
+            return self._json(200, {"object": "list", "data": data})
+
+        if self.path == "/":
+            if not self._authorized():
+                return self._json(401, openai_error(401, "missing or invalid api key", "auth_error"))
+            with POOL.cond:
+                pool_info = {"processes": POOL.total,
+                             "idle": {f"{k[0]}|{k[1] or '-'}": len(v) for k, v in POOL.idle.items()}}
+            return self._json(200, {"service": "agy-facade", "backend": "official agy CLI (stream-json)",
+                                    "multimodal": {"images": True, "audio": True, "image_generation": bool(CFG.get("enable_image_generation"))},
+                                    "pool": pool_info, "stats": STATS,
+                                    "pacing": {"turn_gap_sec": CFG.get("min_turn_gap_sec"),
+                                               "jitter_sec": CFG.get("turn_gap_jitter_sec"),
+                                               "turns_done": PACER.turns,
+                                               "total_wait_sec": round(PACER.waited_sec, 1)}})
+        return self._json(404, openai_error(404, "not found", "invalid_request_error"))
+
+    def _read_request(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if not 0 <= length <= CFG["max_request_bytes"]:
+                self.close_connection = True
+                return self._json(413, openai_error(413, "request body too large", "invalid_request_error"))
+            req = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            if not isinstance(req, dict):
+                raise ValueError("expected a JSON object")
+            return req
+        except (ValueError, UnicodeError, RecursionError):
+            self.close_connection = True
+            return self._json(400, openai_error(400, "bad JSON request", "invalid_request_error"))
+
+    def do_POST(self):
+        # Do not reuse a connection with an unread/invalid request body.
+        self.close_connection = True
+        path = self.path.rstrip("/")
+        if path in ("/v1/images/generations", "/images/generations"):
+            key_name = self._authorized()
+            if not key_name:
+                return self._json(401, openai_error(401, "missing or invalid api key", "auth_error"))
+            if not CFG.get("enable_image_generation"):
+                return self._json(404, openai_error(404, "image generation is disabled", "invalid_request_error"))
+            return self._handle_images_generations(key_name)
+
+        if path not in ("/v1/chat/completions", "/chat/completions"):
+            return self._json(404, openai_error(404, "not found", "invalid_request_error"))
+
+        key_name = self._authorized()
+        if not key_name:
+            return self._json(401, openai_error(401, "missing or invalid api key", "auth_error"))
+        req = self._read_request()
+        if req is None:
+            return
+
+        model = req.get("model") or CFG["default_model"]
+        messages = req.get("messages") or []
+        if not isinstance(model, str) or not isinstance(messages, list) or not messages or any(not isinstance(m, dict) for m in messages):
+            return self._json(400, openai_error(400, "messages required", "invalid_request_error"))
+
+        t0 = time.time()
+
+        # Если запрошена модель генерации изображений через чат
+        if model in IMAGE_MODELS:
+            if not CFG.get("enable_image_generation"):
+                return self._json(404, openai_error(404, "image generation is disabled", "invalid_request_error"))
+            prompt = ""
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    c = m.get("content")
+                    if isinstance(c, str):
+                        prompt = c
+                    elif isinstance(c, list):
+                        prompt = " ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
+                    if prompt:
+                        break
+            if not prompt:
+                return self._json(400, openai_error(400, "user prompt required for image generation", "invalid_request_error"))
+            return self._serve_image_generation_chat(prompt, model, key_name, req.get("stream", False), t0)
+
+        known = CATALOG.get()
+        if known and model not in known and model not in CFG.get("extra_models", []) and model not in IMAGE_MODELS:
+            return self._json(400, openai_error(
+                400, f"model {model} is not selectable by agy; see GET /v1/models",
+                "invalid_request_error"))
+
+        effort = EFFORT_MAP.get(str(req.get("reasoning_effort") or "").lower())
+        prompt, media_items = build_prompt_and_media(req, messages)
+
+        log(f"--> POST /v1/chat/completions: model={model}, msgs={len(messages)}, media={len(media_items)} {[m[0] for m in media_items]}")
+
+        has_audio = any(m[0].startswith("audio/") for m in media_items)
+        if has_audio and (model.startswith("claude") or model.startswith("gpt")):
+            return self._json(400, openai_error(
+                400,
+                f"Model '{model}' does not support audio input. Please select a Gemini model (such as gemini-3.8-flash-high).",
+                "invalid_request_error"))
+
+        with _lock:
+            STATS["requests"] += 1
+            if media_items:
+                STATS["media_turns"] = STATS.get("media_turns", 0) + 1
+            STATS["by_model"][model] = STATS["by_model"].get(model, 0) + 1
+            STATS["by_key"][key_name] = STATS["by_key"].get(key_name, 0) + 1
+
+        stop = req.get("stop")
+
+        if req.get("stream"):
+            return self._serve(prompt, model, effort, key_name, stream=True, t0=t0, media_items=media_items, stop=stop)
+        return self._serve(prompt, model, effort, key_name, stream=False, t0=t0, media_items=media_items, stop=stop)
+
+    def _serve_image_generation_chat(self, prompt, model, key_name, stream, t0):
+        try:
+            dest_path, img_name = PACER.run(lambda: generate_image_via_agy(
+                prompt, timeout=CFG.get("image_generation_timeout_sec", 120)))
+        except AgyError as e:
+            return self._json(e.status, openai_error(e.status, e.message))
+        except Exception as e:
+            return self._json(500, openai_error(500, str(e)))
+
+        host = f"{CFG['listen_host']}:{CFG['listen_port']}"
+        img_url = f"http://{host}/v1/images/{img_name}"
+        reply_text = f"![{prompt}]({img_url})\n\nGenerated image: {img_url}"
+
+        cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+        created = int(time.time())
+        usage = {"prompt_tokens": len(prompt.split()), "completion_tokens": 25, "total_tokens": len(prompt.split()) + 25}
+
+        with _lock:
+            STATS["requests"] += 1
+            STATS["images"] = STATS.get("images", 0) + 1
+            STATS["by_model"][model] = STATS["by_model"].get(model, 0) + 1
+            STATS["by_key"][key_name] = STATS["by_key"].get(key_name, 0) + 1
+
+        log(f"{model}: image ready in {time.time()-t0:.1f}s -> {img_name}")
+
+        if not stream:
+            return self._json(200, {
+                "id": cid, "object": "chat.completion", "created": created, "model": model,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": reply_text}, "finish_reason": "stop"}],
+                "usage": usage
+            })
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            d = {"role": "assistant", "content": reply_text}
+            chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                     "model": model, "choices": [{"index": 0, "delta": d, "finish_reason": None}]}
+            self.wfile.write(b"data: " + json.dumps(chunk, ensure_ascii=False).encode() + b"\n\n")
+            fin = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                   "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                   "usage": usage}
+            self.wfile.write(b"data: " + json.dumps(fin, ensure_ascii=False).encode() + b"\n\n")
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            log(f"{model}: клиент закрыл стрим изображения")
+
+    def _handle_images_generations(self, key_name):
+        req = self._read_request()
+        if req is None:
+            return
+
+        prompt = req.get("prompt")
+        if not prompt or not isinstance(prompt, str):
+            return self._json(400, openai_error(400, "prompt is required", "invalid_request_error"))
+
+        size = req.get("size")
+        response_format = req.get("response_format", "url")
+        model = req.get("model") or "image-generator"
+        t0 = time.time()
+
+        try:
+            dest_path, img_name = PACER.run(lambda: generate_image_via_agy(
+                prompt, size, timeout=CFG.get("image_generation_timeout_sec", 120)))
+        except AgyError as e:
+            log(f"image-generator: {e.message}")
+            return self._json(e.status, openai_error(e.status, e.message))
+        except Exception as e:
+            log(f"image-generator: {e}")
+            return self._json(500, openai_error(500, str(e)))
+
+        with _lock:
+            STATS["requests"] += 1
+            STATS["images"] = STATS.get("images", 0) + 1
+            STATS["by_model"][model] = STATS["by_model"].get(model, 0) + 1
+            STATS["by_key"][key_name] = STATS["by_key"].get(key_name, 0) + 1
+
+        log(f"image-generator: ready in {time.time()-t0:.1f}s -> {img_name}")
+        created = int(time.time())
+        if response_format == "b64_json":
+            with open(dest_path, "rb") as f:
+                b64_data = base64.b64encode(f.read()).decode("ascii")
+            return self._json(200, {
+                "created": created,
+                "data": [{"b64_json": b64_data, "revised_prompt": prompt}]
+            })
+        else:
+            host = f"{CFG['listen_host']}:{CFG['listen_port']}"
+            img_url = f"http://{host}/v1/images/{img_name}"
+            return self._json(200, {
+                "created": created,
+                "data": [{"url": img_url, "revised_prompt": prompt}]
+            })
+
+    def _serve(self, prompt, model, effort, key_name, stream, t0, media_items=None, stop=None):
+        cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+        created = int(time.time())
+        chunks = queue.Queue()
+        result = {}
+        abort_event = threading.Event()
+
+        def on_delta(text):
+            if not abort_event.is_set():
+                chunks.put(text)
+
+        def job():
+            try:
+                w = POOL.acquire(model, effort)
+                try:
+                    text, usage = PACER.run(lambda: w.run_turn(
+                        prompt, media_items, on_delta if stream else None, CFG["request_timeout_sec"],
+                        abort_event=abort_event, stop=stop))
+                    result.update(text=text, usage=usage)
+                finally:
+                    POOL.release_dead(w)
+            except AgyError as e:
+                result.update(error=e)
+            except Exception as e:
+                result.update(error=AgyError(str(e)))
+            finally:
+                chunks.put(None)
+
+        threading.Thread(target=job, daemon=True).start()
+        if not stream:
+            while chunks.get() is not None:
+                pass
+            if "error" in result:
+                e = result["error"]
+                log(f"{model}: agy {e.status} за {time.time()-t0:.1f}с")
+                return self._json(e.status, openai_error(e.status, e.message))
+            usage = map_usage(result.get("usage"))
+            with _lock:
+                STATS["tokens"]["prompt"] += usage["prompt_tokens"]
+                STATS["tokens"]["completion"] += usage["completion_tokens"]
+            log(f"{model}: готово за {time.time()-t0:.1f}с, токенов {usage['total_tokens']}")
+            return self._json(200, {
+                "id": cid, "object": "chat.completion", "created": created, "model": model,
+                "choices": [{"index": 0,
+                             "message": {"role": "assistant", "content": result["text"]},
+                             "finish_reason": "stop"}],
+                "usage": usage})
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        sent_role = False
+        try:
+            while True:
+                delta = chunks.get()
+                if delta is None:
+                    break
+                d = {"content": delta}
+                if not sent_role:
+                    d = dict(d, role="assistant")
+                    sent_role = True
+                chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                         "model": model,
+                         "choices": [{"index": 0, "delta": d, "finish_reason": None}]}
+                self.wfile.write(b"data: " + json.dumps(chunk, ensure_ascii=False).encode() + b"\n\n")
+                self.wfile.flush()
+            if "error" in result:
+                e = result["error"]
+                err_chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                             "model": model, "choices": [],
+                             "error": {"message": e.message, "type": "upstream_error", "code": e.status}}
+                self.wfile.write(b"data: " + json.dumps(err_chunk, ensure_ascii=False).encode() + b"\n\n")
+            else:
+                usage = map_usage(result.get("usage"))
+                with _lock:
+                    STATS["tokens"]["prompt"] += usage["prompt_tokens"]
+                    STATS["tokens"]["completion"] += usage["completion_tokens"]
+                fin = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                       "model": model,
+                       "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                       "usage": usage}
+                self.wfile.write(b"data: " + json.dumps(fin, ensure_ascii=False).encode() + b"\n\n")
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            abort_event.set()
+            log(f"{model}: клиент оборвал стрим (retry/abort)")
+        log(f"{model}: стрим завершён за {time.time()-t0:.1f}с")
+
+
+def load_config(path):
+    if not os.path.exists(path):
+        try:
+            with open(path, "w") as f:
+                json.dump(DEFAULT_CONFIG, f, indent=1, ensure_ascii=False)
+            log(f"создан конфиг по умолчанию: {path}")
+        except OSError:
+            pass
+    if os.path.exists(path):
+        with open(path) as f:
+            CFG.update(json.load(f))
+
+
+def detach_stdin():
+    """Фасад и его дети не должны касаться терминала."""
+    try:
+        fd = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(fd, 0)
+    except OSError:
+        pass
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "keys":
+        sys.exit(key_management(sys.argv[2:]))
+    ap = argparse.ArgumentParser(description="OpenAI-фасад к Antigravity через официальный agy CLI")
+    ap.add_argument("--config", default=os.path.join(STATE_DIR, "agy_config.json"))
+    ap.add_argument("--host")
+    ap.add_argument("--port", type=int)
+    args = ap.parse_args()
+    detach_stdin()
+    os.makedirs(IMAGE_DIR, exist_ok=True)
+    load_config(args.config)
+    if args.host:
+        CFG["listen_host"] = args.host
+    if args.port:
+        CFG["listen_port"] = args.port
+    if CFG["listen_host"] != "127.0.0.1":
+        ap.error("only 127.0.0.1 is supported by this local-only snapshot")
+    if not active_keys():
+        ap.error("no active key: run agy_facade.py keys add <name> first")
+    agy_path = find_agy()
+    if not shutil.which(agy_path) and not (os.path.isfile(agy_path) and os.access(agy_path, os.X_OK)):
+        log(f"ОШИБКА: бинарь agy не найден ({agy_path}). Укажите путь: поле agy_bin "
+            f"в agy_config.json или переменная AGY_BIN. Фасад не запущен.")
+        sys.exit(1)
+    log(f"agy: {agy_path}")
+    for m in (CFG.get("warm_models") or [CFG["default_model"]]):
+        POOL.warm(m)
+    CATALOG.get()
+    srv = SafeThreadingHTTPServer((CFG["listen_host"], CFG["listen_port"]), Handler)
+    log(f"agy-facade слушает http://{CFG['listen_host']}:{CFG['listen_port']}/v1")
+
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
