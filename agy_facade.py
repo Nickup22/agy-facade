@@ -6,7 +6,9 @@ Unofficial and experimental. Uses stream-json for chat and starts a new CLI
 process per turn from a warmed pool. See README.md for security boundaries.
 """
 import argparse, base64, hashlib, json, mimetypes, os, queue, re, shutil, subprocess, sys, threading, time
-import urllib.parse, uuid
+import select, selectors, socket, urllib.parse, uuid
+from collections import deque
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 STATE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -26,7 +28,12 @@ DEFAULT_CONFIG = {
     "spawn_timeout_sec": 60,          # Time allowed for the CLI init event.
     "request_timeout_sec": 300,
     "image_generation_timeout_sec": 120,
-    "max_concurrent": 2,              # Legacy setting; Pacer serializes CLI turns.
+    "max_concurrent": 1,              # Legacy setting; turns always run one at a time.
+    "max_queued_requests": 16,        # Waiting turns, not counting the active turn.
+    "max_inflight_body_bytes": 96 * 1024**2,
+    "queue_timeout_sec": 300,
+    "http_io_timeout_sec": 15,        # Socket inactivity and stalled writes.
+    "body_timeout_sec": 60,           # Wall-clock upload limit.
     "min_turn_gap_sec": 4,
     "turn_gap_jitter_sec": 1.5,
     "models_ttl_sec": 600,
@@ -715,6 +722,7 @@ class Worker:
             pass
         self.dead = True
         self.events.put(None)
+        self.proc.stdout.close()
 
     def wait_ready(self, timeout):
         return self.ready.wait(timeout) and not self.dead
@@ -786,11 +794,26 @@ class Worker:
             user_msg["media"] = media_payload
 
         line = json.dumps({"event": "user", "message": user_msg}, ensure_ascii=False)
+        deadline = time.monotonic() + timeout
         try:
-            self.proc.stdin.write(line + "\n")
-            self.proc.stdin.flush()
-        except Exception as e:
-            raise AgyError(f"agy stdin: {e}")
+            fd = self.proc.stdin.fileno()
+            os.set_blocking(fd, False)
+            remaining = memoryview((line + "\n").encode(self.proc.stdin.encoding or "utf-8"))
+            with selectors.DefaultSelector() as selector:
+                selector.register(fd, selectors.EVENT_WRITE)
+                while remaining:
+                    if abort_event and abort_event.is_set():
+                        raise AgyError("client aborted turn", 499)
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise AgyError("agy timed out writing the request", 504)
+                    if selector.select(min(left, 0.25)):
+                        try:
+                            remaining = remaining[os.write(fd, remaining):]
+                        except BlockingIOError:
+                            continue
+        except (OSError, ValueError) as e:
+            raise AgyError(f"agy stdin: {e}") from e
 
         stop_list = []
         if isinstance(stop, str) and stop:
@@ -806,17 +829,15 @@ class Worker:
         has_streamed_in_step = False
         stopped = False
         safety_detected_in_turn = False
-        deadline = time.time() + timeout
         while True:
             if abort_event and abort_event.is_set():
-                self.close()
                 raise AgyError("client aborted turn", 499)
 
-            left = deadline - time.time()
+            left = deadline - time.monotonic()
             if left <= 0:
                 raise AgyError("agy timed out", 504)
             try:
-                ev = self.events.get(timeout=min(left, 2))
+                ev = self.events.get(timeout=min(left, 0.25))
             except queue.Empty:
                 if self.dead:
                     raise AgyError("agy process died mid-turn")
@@ -928,73 +949,114 @@ class Worker:
 
     def close(self):
         try:
-            self.proc.kill()
-        except Exception:
-            pass
-        cleanup_conversation(self.conversation_id)
+            if self.proc.poll() is None:
+                self.proc.kill()
+            self.proc.wait()
+        finally:
+            self.proc.stdin.close()
+            cleanup_conversation(self.conversation_id)
 
 
 class Pool:
     def __init__(self):
         self.idle = {}            # (model, effort) -> [Worker]
         self.total = 0
+        self.starting = {}
         self.cond = threading.Condition()
 
     def _spawn_async(self, key):
+        # Called with cond held; one pending spawn counts against capacity.
+        self.total += 1
+        self.starting[key] = self.starting.get(key, 0) + 1
+
+        def finished(worker):
+            self.starting[key] -= 1
+            if not self.starting[key]:
+                del self.starting[key]
+            if worker is None:
+                self.total -= 1
+            else:
+                self.idle.setdefault(key, []).append(worker)
+            self.cond.notify_all()
+
         def job():
+            w = None
+            ready = False
             try:
                 w = Worker(*key)
-                if w.wait_ready(CFG["spawn_timeout_sec"]):
-                    with self.cond:
-                        self.idle.setdefault(key, []).append(w)
-                        self.cond.notify_all()
-                    return
-                log(f"spawn {key}: worker failed to start: {w.spawn_error or 'no init event'}")
-                w.close()
+                ready = w.wait_ready(CFG["spawn_timeout_sec"])
+                if not ready:
+                    log(f"spawn {key}: worker failed to start: {w.spawn_error or 'no init event'}")
             except Exception as e:
                 log(f"spawn {key}: {e}")
-            with self.cond:
-                self.total -= 1
-                self.cond.notify_all()
-        threading.Thread(target=job, daemon=True).start()
+            finally:
+                try:
+                    if w is not None and not ready:
+                        w.close()
+                finally:
+                    with self.cond:
+                        finished(w if ready else None)
+        try:
+            threading.Thread(target=job, daemon=True).start()
+        except BaseException:
+            finished(None)
+            raise
 
     def warm(self, model, effort=None):
         key = (model, effort)
         with self.cond:
-            have = len(self.idle.get(key, []))
+            have = len(self.idle.get(key, [])) + self.starting.get(key, 0)
             for _ in range(max(0, CFG["pool_per_key"] - have)):
                 if self.total >= CFG["pool_max_processes"]:
                     break
-                self.total += 1
                 self._spawn_async(key)
 
-    def acquire(self, model, effort):
+    def acquire(self, model, effort, abort_event=None):
         key = (model, effort)
-        deadline = time.time() + CFG["spawn_timeout_sec"] + 10
+        deadline = time.monotonic() + CFG["spawn_timeout_sec"] + 10
+        requested_spawn = False
         while True:
             with self.cond:
-                lst = self.idle.get(key, [])
-                while lst:
-                    w = lst.pop(0)
-                    if not w.dead:
-                        if self.total < CFG["pool_max_processes"]:
-                            self.total += 1
-                            self._spawn_async(key)
-                        return w
-                    self.total -= 1
-                if self.total < CFG["pool_max_processes"]:
-                    self.total += 1
-                    self._spawn_async(key)
-                left = deadline - time.time()
+                if abort_event and abort_event.is_set():
+                    raise AgyError("client aborted turn", 499)
+                left = deadline - time.monotonic()
                 if left <= 0:
                     raise AgyError("no agy worker became ready in time", 503)
-                self.cond.wait(timeout=min(left, 2))
+                workers = self.idle.get(key)
+                if workers:
+                    w = workers.pop(0)
+                    if not workers:
+                        self.idle.pop(key)
+                    if not w.dead:
+                        if self.total < CFG["pool_max_processes"] and not workers and not self.starting.get(key):
+                            self._spawn_async(key)
+                        return w
+                elif self.starting.get(key):
+                    self.cond.wait(timeout=min(left, 0.25))
+                    continue
+                elif requested_spawn:
+                    raise AgyError("agy worker failed to start", 503)
+                elif self.total < CFG["pool_max_processes"]:
+                    self._spawn_async(key)
+                    requested_spawn = True
+                    continue
+                elif self.idle:
+                    other_key = next(iter(self.idle))
+                    w = self.idle[other_key].pop(0)
+                    if not self.idle[other_key]:
+                        del self.idle[other_key]
+                else:
+                    self.cond.wait(timeout=min(left, 0.25))
+                    continue
+            self.release_dead(w)
 
     def release_dead(self, w):
-        with self.cond:
-            self.total -= 1
-            self.cond.notify_all()
-        w.close()
+        try:
+            w.close()
+        finally:
+            with self.cond:
+                self.total -= 1
+                self.cond.notify_all()
 
 
 POOL = Pool()
@@ -1009,21 +1071,27 @@ class Pacer:
         self.turns = 0
         self.waited_sec = 0.0
 
-    def run(self, fn):
+    def run(self, fn, abort_event=None):
         with self.lock:
             gap = float(CFG.get("min_turn_gap_sec", 0) or 0)
             jitter = float(CFG.get("turn_gap_jitter_sec", 0) or 0)
             if jitter > 0:
                 import random
                 gap += random.uniform(0, jitter)
-            wait = self.last_end + gap - time.time()
+            wait = self.last_end + gap - time.monotonic()
             if wait > 0:
-                time.sleep(wait)
-                self.waited_sec += wait
+                started_wait = time.monotonic()
+                if abort_event:
+                    abort_event.wait(wait)
+                else:
+                    time.sleep(wait)
+                self.waited_sec += time.monotonic() - started_wait
+            if abort_event and abort_event.is_set():
+                raise AgyError("client aborted turn", 499)
             try:
                 return fn()
             finally:
-                self.last_end = time.time()
+                self.last_end = time.monotonic()
                 self.turns += 1
 
 
@@ -1048,8 +1116,98 @@ def map_usage(u):
                                   u.get("input_tokens", 0) + u.get("output_tokens", 0))}
 
 
+class QueueError(Exception):
+    def __init__(self, status, message, code):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+
+
+class RequestQueue:
+    """Bound uploads by bytes and run fully uploaded requests in FIFO order."""
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.waiting = deque()
+        self.active = False
+        self.body_bytes = 0
+
+    @contextmanager
+    def reserve_body(self, size):
+        with self.cond:
+            if self.body_bytes + size > CFG["max_inflight_body_bytes"]:
+                raise QueueError(429, "request body budget is full; retry later", "body_budget_full")
+            self.body_bytes += size
+        try:
+            yield
+        finally:
+            with self.cond:
+                self.body_bytes -= size
+
+    @contextmanager
+    def turn(self, disconnected):
+        ticket = object()
+        deadline = time.monotonic() + CFG["queue_timeout_sec"]
+        with self.cond:
+            if self.active or self.waiting:
+                if len(self.waiting) >= CFG["max_queued_requests"]:
+                    raise QueueError(429, "request queue is full; retry later", "queue_full")
+                self.waiting.append(ticket)
+                try:
+                    while True:
+                        if disconnected():
+                            raise QueueError(499, "client disconnected", "client_disconnected")
+                        left = deadline - time.monotonic()
+                        if left <= 0:
+                            raise QueueError(503, "request expired waiting in queue; retry later", "queue_timeout")
+                        if not self.active and self.waiting[0] is ticket:
+                            break
+                        self.cond.wait(min(left, 0.25))
+                finally:
+                    self.waiting.remove(ticket)
+                    self.cond.notify_all()
+            elif disconnected():
+                raise QueueError(499, "client disconnected", "client_disconnected")
+            self.active = True
+        try:
+            yield
+        finally:
+            with self.cond:
+                self.active = False
+                self.cond.notify_all()
+
+    def status(self):
+        with self.cond:
+            return {"active": int(self.active), "waiting": len(self.waiting),
+                    "max_waiting": CFG["max_queued_requests"], "body_bytes": self.body_bytes,
+                    "max_body_bytes": CFG["max_inflight_body_bytes"]}
+
+
 class SafeThreadingHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = 64
+    max_connections = 48
+
+    def __init__(self, *args, **kwargs):
+        self.turn_queue = RequestQueue()
+        self.connections = threading.BoundedSemaphore(self.max_connections)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self.connections.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.connections.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.connections.release()
 
     def handle_error(self, request, client_address):
         err = sys.exc_info()[1]
@@ -1061,6 +1219,21 @@ class SafeThreadingHTTPServer(ThreadingHTTPServer):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "agy-facade/1.0"
+
+    def setup(self):
+        self.request.settimeout(CFG["http_io_timeout_sec"])
+        super().setup()
+
+    def _client_disconnected(self):
+        try:
+            # POST connections are not reused. EOF means we can discard the turn.
+            poller = select.poll()
+            poller.register(self.connection, select.POLLIN)
+            return bool(poller.poll(0)) and not self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+        except (BlockingIOError, InterruptedError):
+            return False
+        except OSError:
+            return True
 
     def handle_one_request(self):
         try:
@@ -1077,6 +1250,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            if self.close_connection:
+                self.send_header("Connection", "close")
             for k, v in (extra_headers or {}).items():
                 self.send_header(k, v)
             self.end_headers()
@@ -1152,48 +1327,80 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"service": "agy-facade", "backend": "official agy CLI (stream-json)",
                                     "multimodal": {"images": True, "audio": True, "image_generation": bool(CFG.get("enable_image_generation"))},
                                     "pool": pool_info, "stats": STATS,
+                                    "queue": self.server.turn_queue.status(),
                                     "pacing": {"turn_gap_sec": CFG.get("min_turn_gap_sec"),
                                                "jitter_sec": CFG.get("turn_gap_jitter_sec"),
                                                "turns_done": PACER.turns,
                                                "total_wait_sec": round(PACER.waited_sec, 1)}})
         return self._json(404, openai_error(404, "not found", "invalid_request_error"))
 
-    def _read_request(self):
+    def _body_length(self):
+        lengths = self.headers.get_all("Content-Length", [])
+        if self.headers.get_all("Transfer-Encoding") or len(lengths) != 1 or not re.fullmatch(r"[0-9]+", lengths[0]):
+            raise QueueError(400, "expected one valid Content-Length and no Transfer-Encoding", "invalid_request_error")
+        digits = lengths[0].lstrip("0") or "0"
+        max_bytes = CFG["max_request_bytes"]
+        if len(digits) > len(str(max_bytes)) or int(digits) > max_bytes:
+            raise QueueError(413, "request body too large", "invalid_request_error")
+        return int(digits)
+
+    def _read_body(self, length):
+        body = bytearray()
+        deadline = time.monotonic() + CFG["body_timeout_sec"]
+        io_timeout = CFG["http_io_timeout_sec"]
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-            if not 0 <= length <= CFG["max_request_bytes"]:
-                self.close_connection = True
-                return self._json(413, openai_error(413, "request body too large", "invalid_request_error"))
-            req = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
-            if not isinstance(req, dict):
-                raise ValueError("expected a JSON object")
-            return req
-        except (ValueError, UnicodeError, RecursionError):
-            self.close_connection = True
-            return self._json(400, openai_error(400, "bad JSON request", "invalid_request_error"))
+            while len(body) < length:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError
+                self.connection.settimeout(min(left, io_timeout))
+                chunk = self.rfile.read1(min(64 * 1024, length - len(body)))
+                if not chunk:
+                    raise QueueError(400, "incomplete request body", "invalid_request_error")
+                body.extend(chunk)
+        except TimeoutError:
+            raise QueueError(408, "timed out reading request body", "request_body_timeout") from None
+        finally:
+            self.connection.settimeout(io_timeout)
+        return body
 
     def do_POST(self):
-        # Do not reuse a connection with an unread or invalid request body.
         self.close_connection = True
         path = self.path.rstrip("/")
-        if path in ("/v1/images/generations", "/images/generations"):
-            key_name = self._authorized()
-            if not key_name:
-                return self._json(401, openai_error(401, "missing or invalid api key", "auth_error"))
-            if not CFG.get("enable_image_generation"):
-                return self._json(404, openai_error(404, "image generation is disabled", "invalid_request_error"))
-            return self._handle_images_generations(key_name)
-
-        if path not in ("/v1/chat/completions", "/chat/completions"):
+        images = path in ("/v1/images/generations", "/images/generations")
+        if not images and path not in ("/v1/chat/completions", "/chat/completions"):
             return self._json(404, openai_error(404, "not found", "invalid_request_error"))
-
         key_name = self._authorized()
         if not key_name:
             return self._json(401, openai_error(401, "missing or invalid api key", "auth_error"))
-        req = self._read_request()
-        if req is None:
-            return
+        if images and not CFG.get("enable_image_generation"):
+            return self._json(404, openai_error(404, "image generation is disabled", "invalid_request_error"))
 
+        turn_queue = self.server.turn_queue
+        try:
+            length = self._body_length()
+            with turn_queue.reserve_body(length):
+                body = self._read_body(length)
+                with turn_queue.turn(self._client_disconnected):
+                    try:
+                        req = json.loads(body)
+                        if not isinstance(req, dict):
+                            raise ValueError("expected a JSON object")
+                    except (ValueError, RecursionError):
+                        raise QueueError(400, "bad JSON request", "invalid_request_error") from None
+                    finally:
+                        del body
+                    if images:
+                        return self._handle_images_generations(key_name, req)
+                    return self._handle_chat(key_name, req)
+        except QueueError as e:
+            if e.status == 499:
+                return
+            headers = {"Retry-After": "5"} if e.status in (429, 503) else None
+            error = openai_error(e.status, str(e), e.code)
+            return self._json(e.status, error, headers)
+
+    def _handle_chat(self, key_name, req):
         model = req.get("model") or CFG["default_model"]
         messages = req.get("messages") or []
         if not isinstance(model, str) or not isinstance(messages, list) or not messages or any(not isinstance(m, dict) for m in messages):
@@ -1301,11 +1508,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             log(f"{model}: client closed the image stream")
 
-    def _handle_images_generations(self, key_name):
-        req = self._read_request()
-        if req is None:
-            return
-
+    def _handle_images_generations(self, key_name, req):
         prompt = req.get("prompt")
         if not prompt or not isinstance(prompt, str):
             return self._json(400, openai_error(400, "prompt is required", "invalid_request_error"))
@@ -1351,35 +1554,73 @@ class Handler(BaseHTTPRequestHandler):
     def _serve(self, prompt, model, effort, key_name, stream, t0, media_items=None, stop=None):
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
-        chunks = queue.Queue()
+        chunks = queue.Queue(maxsize=64)
         result = {}
         abort_event = threading.Event()
+        finished = threading.Event()
 
         def on_delta(text):
-            if not abort_event.is_set():
-                chunks.put(text)
+            while not abort_event.is_set():
+                try:
+                    chunks.put(text, timeout=0.25)
+                    return
+                except queue.Full:
+                    pass
+
+        def next_chunk():
+            while True:
+                try:
+                    return chunks.get_nowait()
+                except queue.Empty:
+                    if finished.is_set():
+                        # A last delta may have been queued before the event was set.
+                        try:
+                            return chunks.get_nowait()
+                        except queue.Empty:
+                            return None
+                    if self._client_disconnected():
+                        raise ConnectionResetError
+                    if not stream:
+                        finished.wait(0.25)
+                    else:
+                        try:
+                            return chunks.get(timeout=0.25)
+                        except queue.Empty:
+                            pass
 
         def job():
-            try:
-                w = POOL.acquire(model, effort)
+            def run_turn():
+                w = POOL.acquire(model, effort, abort_event=abort_event)
                 try:
-                    text, usage = PACER.run(lambda: w.run_turn(
-                        prompt, media_items, on_delta if stream else None, CFG["request_timeout_sec"],
-                        abort_event=abort_event, stop=stop))
-                    result.update(text=text, usage=usage)
+                    return w.run_turn(prompt, media_items, on_delta if stream else None,
+                                      CFG["request_timeout_sec"], abort_event=abort_event, stop=stop)
                 finally:
                     POOL.release_dead(w)
+
+            try:
+                text, usage = PACER.run(run_turn, abort_event)
+                result.update(text=text, usage=usage)
             except AgyError as e:
                 result.update(error=e)
             except Exception as e:
                 result.update(error=AgyError(str(e)))
             finally:
-                chunks.put(None)
+                finished.set()
 
-        threading.Thread(target=job, daemon=True).start()
+        thread = threading.Thread(target=job, daemon=True)
+        thread.start()
+        try:
+            return self._deliver_chat(cid, created, model, stream, t0, result, next_chunk)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            log(f"{model}: client disconnected or stopped reading")
+        finally:
+            # Do not hand off the FIFO slot until CLI I/O and cleanup have stopped.
+            abort_event.set()
+            thread.join()
+
+    def _deliver_chat(self, cid, created, model, stream, t0, result, next_chunk):
         if not stream:
-            while chunks.get() is not None:
-                pass
+            next_chunk()
             if "error" in result:
                 e = result["error"]
                 log(f"{model}: agy {e.status} in {time.time()-t0:.1f}s")
@@ -1405,7 +1646,7 @@ class Handler(BaseHTTPRequestHandler):
         sent_role = False
         try:
             while True:
-                delta = chunks.get()
+                delta = next_chunk()
                 if delta is None:
                     break
                 d = {"content": delta}
@@ -1435,10 +1676,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"data: " + json.dumps(fin, ensure_ascii=False).encode() + b"\n\n")
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            abort_event.set()
-            log(f"{model}: client disconnected from the stream")
-        log(f"{model}: stream ended in {time.time()-t0:.1f}s")
+        finally:
+            log(f"{model}: stream ended in {time.time()-t0:.1f}s")
 
 
 def load_config(path):
@@ -1480,6 +1719,15 @@ def main():
         CFG["listen_port"] = args.port
     if CFG["listen_host"] != "127.0.0.1":
         ap.error("only 127.0.0.1 is supported by this local-only snapshot")
+    for key, minimum in (("max_queued_requests", 0), ("max_request_bytes", 1),
+                         ("max_inflight_body_bytes", CFG["max_request_bytes"])):
+        value = CFG[key]
+        if type(value) is not int or value < minimum:
+            ap.error(f"{key} must be an integer >= {minimum}")
+    for key in ("queue_timeout_sec", "http_io_timeout_sec", "body_timeout_sec"):
+        value = CFG[key]
+        if type(value) not in (int, float) or not 0 < value <= 86_400:
+            ap.error(f"{key} must be a positive number <= 86400")
     if not active_keys():
         ap.error("no active key: run agy_facade.py keys add <name> first")
     agy_path = find_agy()

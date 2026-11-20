@@ -50,9 +50,26 @@ For streaming, add `"stream":true` to the request body and use `curl -N`. For th
 | `GET /v1/images/<filename>` | Download a generated image with the same facade authentication |
 
 - **Partial OpenAI compatibility.** There is no Responses API, embeddings, transcription, or OpenAI function-calling contract. Don't assume sampling settings, structured outputs, or token limits are honored. Native role separation is lost when the history is assembled into one turn; usage fields depend on what the CLI reports.
-- **Not a throughput server.** Turns are serialized even when processes are prewarmed. Configured pacing, CLI startup, backend latency, and queueing can make tails long. Upstream errors on a stream arrive after the HTTP headers.
+- **Not a throughput server.** Chat and image generation share one FIFO turn queue. Only one request can acquire a CLI worker at a time, including when other processes are prewarmed. Upstream errors on a stream arrive after the HTTP headers.
 - **Media is the least portable part.** Put inline data URIs or base64 in supported content blocks. The public snapshot does not fetch client-supplied media URLs or open client-supplied paths. Audio is not supported by every model. The adapter deduplicates attachments and drops older history media when selecting which files to send. Live media behavior is not covered by the offline tests.
 - **Image generation is opt-in.** Set `enable_image_generation` to `true` only in a dedicated CLI profile/OS account for this project. It relies on an image appearing among new CLI session artifacts and may select the wrong artifact if another session is generating images at the same time. Standard CLI permission prompts and model availability can prevent completion. Prefer `b64_json` for clients that cannot attach auth headers to image downloads.
+
+## Queue and overload
+
+Authenticated POSTs enter FIFO order **after the complete body has been received**, so a slow upload does not block ready requests from taking a turn. Media is decoded only when the request reaches the head. This keeps one CLI turn active without pooling requests or sharing their SSE frames. The experimental image-generation routes use the same queue. The old `max_concurrent` setting does not enable multiple turns.
+
+| Configuration | Default | Applies to |
+| --- | ---: | --- |
+| `max_queued_requests` | 16 | Waiting requests, excluding the active one; `0` disables waiting |
+| `queue_timeout_sec` | 300 | Maximum wait to start a turn, separate from CLI startup and inference |
+| `max_request_bytes` | 24 MiB | One request body (`413` if exceeded) |
+| `max_inflight_body_bytes` | 96 MiB | Combined declared body size for uploads, waiting requests, and the active request; not a process memory cap |
+| `body_timeout_sec` | 60 | Total time allowed to upload the body (`408` on timeout) |
+| `http_io_timeout_sec` | 15 | Socket inactivity during upload or writes, not the maximum inference time |
+
+Queue or byte-budget exhaustion returns `429` with `Retry-After`; expiry in the queue returns `503` with a distinct `queue_timeout` error and no CLI turn. An unavailable CLI worker can still return a different `503`. Connections stay open without response headers while waiting, including SSE clients: set the client's timeout to cover queue wait, CLI startup, pacing, and generation. Closing the connection drops a queued request; TCP write-half-close after upload is not supported. The server closes excess sockets above a separate 48-connection guard, which can surface as a connection error rather than HTTP `429`.
+
+Authenticated `GET /` reports `queue.active`, `queue.waiting`, and body budget usage. When polling status from a separate connection, do not treat queue position as a completion estimate.
 
 ## Security and data
 
@@ -66,8 +83,8 @@ The CLI can send prompts and attachments to its provider. Uploaded media can rem
 python3 -B -m unittest discover -s tests -v
 ```
 
-The tests use temporary state and a mock CLI backend. They exercise HTTP auth, request handling, chat JSON and SSE, and inline-media handling without contacting Google. They are not an end-to-end certification against any specific CLI release.
+The tests use temporary state and a mock CLI backend. They exercise HTTP auth, request handling, chat JSON and SSE, inline-media handling, FIFO order, overload, and cancellation without contacting Google. They are not an end-to-end certification against any specific CLI release.
 
-Possible next steps, not promises: record a live compatibility matrix for specific CLI releases, add bounded queues and better cancellation, tighten media retention and error reporting, and evaluate ACP as a separate transport once capability negotiation and media handling are reliable. The goal is a dependable local adapter, not a public proxy service.
+Possible next steps, not promises: record a live compatibility matrix for specific CLI releases, tighten media retention and error reporting, and evaluate ACP as a separate transport once capability negotiation and media handling are reliable. The goal is a dependable local adapter, not a public proxy service.
 
 No license has been selected for this public snapshot. Public visibility does not grant permission to redistribute or reuse the source.
